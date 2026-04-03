@@ -53,7 +53,11 @@ from glob import glob
 import os, csv, json
 import numpy as np
 import xarray as xr
-from sklearn.cluster import KMeans
+try:
+    from sklearn.cluster import KMeans
+    _HAS_SKLEARN = True
+except ImportError:
+    _HAS_SKLEARN = False
 
 # =============================================================================
 # CONFIG — User-configurable settings
@@ -208,9 +212,11 @@ def _remove_wmean_2d(a, w):
     return a - mu
 
 # -- Load model EOF triplets --
-def _load_model_triplets():
+def _load_model_triplets(eof_globs=None):
     """Return list of (model_name, {2: DataArray, 3: DA, 4: DA})."""
-    file_lists = {n: sorted(glob(EOF_GLOBS[n])) for n in EOF_NUMS}
+    if eof_globs is None:
+        eof_globs = EOF_GLOBS
+    file_lists = {n: sorted(glob(eof_globs[n])) for n in EOF_NUMS}
     n_files = len(file_lists[2])
     assert n_files > 0, "No EOF2 model files found."
     for n in EOF_NUMS:
@@ -579,10 +585,11 @@ def _prepare_eof_sample(eof_da, EA_sub, SCA_sub, w2d, mask_flat, w_sqrt):
 
 
 # -- Save / load centers --
-
-def _save_centers(centers, cluster_types, lat, lon, mask_flat, w_sqrt):
-    """Save cluster centers and metadata to JSON at KMEANS_CENTERS_FILE."""
-    fname = KMEANS_CENTERS_FILE
+def _save_centers(centers, cluster_types, lat, lon, mask_flat, w_sqrt,
+                  centers_file=None):
+    """Save cluster centers and metadata to JSON."""
+    if centers_file is None:
+        centers_file = KMEANS_CENTERS_FILE
     data = {
         "reanalysis": CTRL_REANALYSIS,
         "cmip_tag": CMIP_TAG,
@@ -594,10 +601,10 @@ def _save_centers(centers, cluster_types, lat, lon, mask_flat, w_sqrt):
         "mask_flat": mask_flat.tolist(),
         "w_sqrt": w_sqrt.tolist(),
     }
-    with open(fname, "w") as f:
+    with open(centers_file, "w") as f:
         json.dump(data, f)
-    print(f"[kmeans] saved centers: {fname}")
-    return fname
+    print(f"[kmeans] saved centers: {centers_file}")
+    return centers_file
 
 def _load_centers(filepath):
     """Load saved centers; warn if reanalysis doesn't match current config."""
@@ -621,13 +628,22 @@ def _load_centers(filepath):
 
 
 # -- Train (full ensemble) or Apply (pre-computed) --
-
-def _train_kmeans(EA_ctrl, SCA_ctrl, triplets):
+def _train_kmeans(EA_ctrl, SCA_ctrl, triplets, centers_file=None):
     """
     Train k-means on the full ensemble.  Requires EOF files from ALL models.
     Saves cluster centers to a JSON file for future reuse.
     Returns per-model results dict.
+
+    Requires scikit-learn to be installed.
     """
+    if not _HAS_SKLEARN:
+        raise ImportError(
+            "scikit-learn is required for k-means retraining but is not installed. "
+            "Install it with: pip install scikit-learn (or conda install scikit-learn). "
+            "If you only need to apply pre-computed centers, ensure a valid centers "
+            "file exists at KMEANS_CENTERS_FILE."
+        )
+
     EA_sub, SCA_sub, lat, lon, w2d = _prepare_kmeans_grid(EA_ctrl, SCA_ctrl)
     EA_v, SCA_v = EA_sub.values, SCA_sub.values
 
@@ -664,7 +680,8 @@ def _train_kmeans(EA_ctrl, SCA_ctrl, triplets):
 
     # Label clusters and save
     cluster_types = _label_clusters(km.cluster_centers_, w_sqrt, mf, EA_v, SCA_v, w2d)
-    _save_centers(km.cluster_centers_, cluster_types, lat, lon, mf, w_sqrt)
+    _save_centers(km.cluster_centers_, cluster_types, lat, lon, mf, w_sqrt,
+                  centers_file=centers_file)
 
     # Score each EOF
     results = {}
@@ -712,20 +729,22 @@ def _apply_kmeans(EA_ctrl, SCA_ctrl, triplets, centers_file):
         results[model] = eof_results
     return results
 
-
-def run_kmeans(EA_ctrl, SCA_ctrl, triplets):
+def run_kmeans(EA_ctrl, SCA_ctrl, triplets, kmeans_centers_file=None):
     """
     Apply pre-computed centers if available; otherwise train on first run.
-    On first run, KMEANS_CENTERS_FILE is created from the full ensemble.
+    On first run, the centers file is created from the full ensemble.
     On subsequent runs, the saved centers are loaded and applied per-model.
     """
-    if os.path.isfile(KMEANS_CENTERS_FILE):
-        return _apply_kmeans(EA_ctrl, SCA_ctrl, triplets, KMEANS_CENTERS_FILE)
+    if kmeans_centers_file is None:
+        kmeans_centers_file = KMEANS_CENTERS_FILE
+    if os.path.isfile(kmeans_centers_file):
+        return _apply_kmeans(EA_ctrl, SCA_ctrl, triplets, kmeans_centers_file)
     else:
-        print(f"[kmeans] No centers file found at {KMEANS_CENTERS_FILE}.")
+        print(f"[kmeans] No centers file found at {kmeans_centers_file}.")
         print(f"[kmeans] Training from the full ensemble and saving for future runs.")
         print(f"[kmeans] This requires EOF files from ALL models in EOF_GLOBS.")
-        return _train_kmeans(EA_ctrl, SCA_ctrl, triplets)
+        return _train_kmeans(EA_ctrl, SCA_ctrl, triplets,
+                             centers_file=kmeans_centers_file)
 
 
 # =============================================================================
@@ -772,10 +791,11 @@ def _consensus(method_results):
         return top_label, "weak", cons_conf
     return top_label, "very weak", cons_conf
 
-
-def write_outputs(res_sub, res_corr, res_km):
-    out_tsv = f"{OUTPUT_ROOT}_consensus.tsv"
-    out_txt = f"{OUTPUT_ROOT}_consensus.txt"
+def write_outputs(res_sub, res_corr, res_km, output_root=None):
+    if output_root is None:
+        output_root = OUTPUT_ROOT
+    out_tsv = f"{output_root}_consensus.tsv"
+    out_txt = f"{output_root}_consensus.txt"
 
     models = sorted(set(res_sub) | set(res_corr) | set(res_km))
 
@@ -830,54 +850,106 @@ def write_outputs(res_sub, res_corr, res_km):
     print(f"[output] wrote: {out_tsv}")
     print(f"[output] wrote: {out_txt}")
 
-
 # =============================================================================
 # MAIN
 # =============================================================================
-def main():
-    for f, name in [(EA_CTRL_FILE, "EA"), (SCA_CTRL_FILE, "SCA")]:
+def eof_classification(ea_ctrl_file=None, sca_ctrl_file=None,
+                       eof_globs=None, kmeans_centers_file=None,
+                       output_root=None):
+    """
+    Classify model EOFs as East Atlantic (EA) or Scandinavian (SCA) patterns.
+
+    All parameters are optional.  When None, they fall back to the CONFIG
+    defaults at the top of this module.  This allows the function to be
+    called with no arguments (standalone use) or with explicit paths
+    (programmatic use from PMP or other frameworks).
+
+    Parameters
+    ----------
+    ea_ctrl_file : str or None
+        Path to the EA control pattern netCDF file.
+    sca_ctrl_file : str or None
+        Path to the SCA control pattern netCDF file.
+    eof_globs : dict or None
+        Dictionary mapping EOF number to glob pattern, e.g.
+        {2: "/path/to/EOF2_*.nc", 3: "/path/to/EOF3_*.nc", 4: "/path/to/EOF4_*.nc"}.
+    kmeans_centers_file : str or None
+        Path to pre-computed k-means cluster centers JSON file.
+        If the file exists, saved centers are applied.
+        If it does not exist, k-means trains from the full ensemble and
+        saves centers to this path (requires scikit-learn).
+    output_root : str or None
+        Prefix for output filenames (produces {output_root}_consensus.tsv
+        and {output_root}_consensus.txt).
+
+    Returns
+    -------
+    dict
+        Consensus results keyed by model name, with per-EOF classification
+        labels, confidences, and quality flags.
+    """
+    if ea_ctrl_file is None:
+        ea_ctrl_file = EA_CTRL_FILE
+    if sca_ctrl_file is None:
+        sca_ctrl_file = SCA_CTRL_FILE
+    if kmeans_centers_file is None:
+        kmeans_centers_file = KMEANS_CENTERS_FILE
+    if output_root is None:
+        output_root = OUTPUT_ROOT
+
+    for f, name in [(ea_ctrl_file, "EA"), (sca_ctrl_file, "SCA")]:
         if not os.path.exists(f):
             raise FileNotFoundError(f"{name} control not found: {f}")
 
     print("=" * 60)
     print(f"Controls : {CTRL_REANALYSIS}")
-    print(f"EA  : {EA_CTRL_FILE}  (×{EA_SIGN:+.0f})")
-    print(f"SCA : {SCA_CTRL_FILE} (×{SCA_SIGN:+.0f})")
+    print(f"EA  : {ea_ctrl_file}  (×{EA_SIGN:+.0f})")
+    print(f"SCA : {sca_ctrl_file} (×{SCA_SIGN:+.0f})")
     print(f"Domain: lat={LAT_RANGE}, lon={'ALL' if LON_INTERVALS is None else LON_INTERVALS}")
-    kmeans_mode = "apply saved" if os.path.isfile(KMEANS_CENTERS_FILE) else "train from ensemble"
-    print(f"K-means: {KMEANS_CENTERS_FILE} ({kmeans_mode})")
+    kmeans_mode = "apply saved" if os.path.isfile(kmeans_centers_file) else "train from ensemble"
+    print(f"K-means: {kmeans_centers_file} ({kmeans_mode})")
     print("=" * 60 + "\n")
 
-    EA_ctrl  = EA_SIGN  * _read_da(EA_CTRL_FILE)
-    SCA_ctrl = SCA_SIGN * _read_da(SCA_CTRL_FILE)
-    triplets = _load_model_triplets()
+    EA_ctrl  = EA_SIGN  * _read_da(ea_ctrl_file)
+    SCA_ctrl = SCA_SIGN * _read_da(sca_ctrl_file)
+    triplets = _load_model_triplets(eof_globs=eof_globs)
 
     res_sub  = run_subspace(EA_ctrl, SCA_ctrl, triplets)
     res_corr = run_correlations(EA_ctrl, SCA_ctrl, triplets)
-    res_km   = run_kmeans(EA_ctrl, SCA_ctrl, triplets)
+    res_km   = run_kmeans(EA_ctrl, SCA_ctrl, triplets,
+                          kmeans_centers_file=kmeans_centers_file)
 
-    write_outputs(res_sub, res_corr, res_km)
+    write_outputs(res_sub, res_corr, res_km, output_root=output_root)
+
+    # Build and return consensus results dict
+    models = sorted(set(res_sub) | set(res_corr) | set(res_km))
+    consensus_results = {}
+    for m in models:
+        consensus_results[m] = {}
+        for n in EOF_NUMS:
+            s = res_sub.get(m, {}).get(n, {"label": "NA", "confidence": 0.0})
+            c = res_corr.get(m, {}).get(n, {"label": "NA", "confidence": 0.0})
+            k = res_km.get(m, {}).get(n, {"label": "NA", "confidence": 0.0})
+            cons_label, quality, cons_conf = _consensus([s, c, k])
+            consensus_results[m][n] = {
+                "label": cons_label,
+                "confidence": cons_conf,
+                "quality": quality,
+                "methods": {
+                    "subspace": s,
+                    "correlation": c,
+                    "kmeans": k,
+                },
+            }
+    return consensus_results
+
 
 if __name__ == "__main__":
-    main()
+    eof_classification()
+
 
 
 # =============================================================================
 # K-MEANS RETRAINING (not called during normal classification)
 # =============================================================================
-# The _train_kmeans function above can be used to generate a new centers file
-# if you need to retrain for a different reanalysis or model ensemble.
-#
-# Steps:
-#   1. Set EA_CTRL_FILE and SCA_CTRL_FILE to the new reanalysis control patterns.
-#   2. Set CTRL_REANALYSIS to match (this label is stored in the .json).
-#   3. Set EOF_GLOBS to point to EOF files from the FULL multi-model ensemble.
-#      Training requires many models (~20+) to produce meaningful clusters.
-#   4. Delete or rename the existing KMEANS_CENTERS_FILE so the code retrains.
-#   5. Run the script.  A new .json will be saved at KMEANS_CENTERS_FILE.
-#
-# Alternatively, call _train_kmeans directly:
-#   EA_ctrl  = EA_SIGN  * _read_da(EA_CTRL_FILE)
-#   SCA_ctrl = SCA_SIGN * _read_da(SCA_CTRL_FILE)
-#   triplets = _load_model_triplets()
-#   results  = _train_kmeans(EA_ctrl, SCA_ctrl, triplets)
+# For k-means retraining instructions, see EOF_CLASSIFICATION_GUIDE.md
